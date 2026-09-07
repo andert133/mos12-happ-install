@@ -21,7 +21,7 @@
 
 Скачайте актуальный RPM-файл Happ по ссылке:
 
-**[Скачать Happ.linux.x64.rpm][https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.linux.x64.rpm]**
+**Скачать Happ.linux.x64.rpm https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.linux.x64.rpm**
 
 После скачивания положите `Happ.linux.x64.rpm` **в ту же папку**, где находится `smart-dnf-install`.
 
