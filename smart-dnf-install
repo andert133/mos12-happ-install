@@ -1,0 +1,1178 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+###############################################################################
+# smart-dnf-install (v2)
+#
+# Usage:
+#   sudo ./smart-dnf-install [опции] /path/to/package.rpm [ещё.rpm ...]
+#
+# Опции:
+#   -y, --yes             отвечать «да» на все вопросы
+#   --allow-nodeps        разрешить аварийную установку через rpm --nodeps
+#   --runtime-bundle      поставить совместимый рантайм (glibc/libstdc++/openssl)
+#                         в приватный каталог приложения и завернуть бинарники
+#   --auto                = --yes --allow-nodeps --runtime-bundle
+#   --clean               удалить рабочую папку перед началом
+#   -h, --help            помощь
+#
+# Стратегия:
+#   1. Пытается установить RPM обычным DNF (репозитории + ./smart-dnf-work/deps).
+#   2. Если DNF сообщает «nothing provides ...»:
+#      - классифицирует требование (soname / путь / пакетное / rpmlib);
+#      - ищет пакет, дающий ЭТУ capability (для soname файловый поиск не
+#        выполняется: файл без Provides DNF не устроит);
+#      - скачивает и добавляет в общую транзакцию.
+#   3. Если зависимости в репозиториях нет вообще:
+#      - разбирает ELF-файлы пакета и определяет, какие требования РЕАЛЬНЫЕ
+#        (есть в DT_NEEDED), а какие — «мусор» от сборщика;
+#      - при ложных зависимостях ставит пакет через rpm --nodeps;
+#      - при нехватке glibc/libstdc++/openssl разворачивает совместимый
+#        рантайм (Ubuntu 22.04) в приватный каталог приложения и заворачивает
+#        динамические бинарники в обёртки с собственным ld-linux.
+#        Системные каталоги при этом не изменяются.
+#
+# Инварианты:
+#   - найденные RPM не устанавливаются отдельно, DNF получает их одной
+#     транзакцией вместе с исходным;
+#   - распаковка RPM выполняется ТОЛЬКО для анализа, в рабочую папку;
+#   - rpm --nodeps применяется только когда анализ доказал, что заявленные
+#     зависимости ложные либо закрываются приватным рантаймом.
+###############################################################################
+
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_VERSION="2.0"
+
+WORKDIR="${SMART_DNF_WORKDIR:-$(pwd)/smart-dnf-work}"
+trap 'echo "ОШИБКА: сбой в строке $LINENO (логи: $WORKDIR/logs)" >&2' ERR
+
+###############################################################################
+# Аргументы
+###############################################################################
+
+YES=0
+ALLOW_NODEPS=0
+RUNTIME_BUNDLE=0
+CLEAN=0
+RPMS=()
+
+show_help() {
+    sed -n '4,38p' "$0" | sed 's/^#\{1,\} \{0,1\}//'
+}
+
+while (( $# > 0 )); do
+    case "$1" in
+        -y|--yes)         YES=1 ;;
+        --allow-nodeps)   ALLOW_NODEPS=1 ;;
+        --runtime-bundle) RUNTIME_BUNDLE=1 ;;
+        --auto)           YES=1; ALLOW_NODEPS=1; RUNTIME_BUNDLE=1 ;;
+        --clean)          CLEAN=1 ;;
+        -h|--help)        show_help; exit 0 ;;
+        -*)               echo "Неизвестная опция: $1" >&2; exit 2 ;;
+        *)                RPMS+=("$1") ;;
+    esac
+    shift
+done
+
+if (( ${#RPMS[@]} == 0 )); then
+    echo "Использование:"
+    echo "  sudo $SCRIPT_NAME [опции] /path/to/package.rpm [еще.rpm ...]"
+    echo "Подробнее: $SCRIPT_NAME --help"
+    exit 2
+fi
+
+###############################################################################
+# Окружение
+###############################################################################
+
+for cmd in dnf rpm file readelf objdump cpio ar tar zstd awk sed grep sort python3; do
+    command -v "$cmd" >/dev/null 2>&1 || { echo "Ошибка: не найдено: $cmd" >&2; exit 1; }
+done
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    echo "Ошибка: нужен curl или wget" >&2
+    exit 1
+fi
+if [[ $EUID -ne 0 ]]; then
+    echo "Запусти от root:"
+    echo "  sudo $SCRIPT_NAME ${RPMS[*]}"
+    exit 1
+fi
+
+declare -a INPUT_RPMS=()
+for p in "${RPMS[@]}"; do
+    rp="$(readlink -f "$p")"
+    [[ -f "$rp" ]] || { echo "Ошибка: RPM не найден: $rp" >&2; exit 1; }
+    [[ "${rp##*.}" == "rpm" ]] || { echo "Ошибка: нужен .rpm файл: $rp" >&2; exit 1; }
+    INPUT_RPMS+=("$rp")
+done
+
+SYS_ARCH="$(uname -m)"
+DEPSDIR="$WORKDIR/deps"
+LOGDIR="$WORKDIR/logs"
+INSPECTDIR="$WORKDIR/inspect"
+
+if (( CLEAN )); then
+    rm -rf "$WORKDIR"
+fi
+mkdir -p "$DEPSDIR" "$LOGDIR" "$INSPECTDIR"
+
+GLIBC_SYS="$(rpm -q --qf '%{V}' glibc 2>/dev/null || echo '?')"
+
+echo "============================================================"
+echo " Smart DNF Install v$SCRIPT_VERSION"
+echo "============================================================"
+echo "Система       : $SYS_ARCH, glibc $GLIBC_SYS"
+echo "Исходные RPM  : ${INPUT_RPMS[*]}"
+echo "Рабочая папка : $WORKDIR"
+echo
+
+###############################################################################
+# Служебные функции
+###############################################################################
+
+log()  { echo ">>> $*"; }
+warn() { echo "!!! $*" >&2; }
+die()  { echo "ОШИБКА: $*" >&2; exit 1; }
+
+fetch() { # fetch <url> <файл>
+    local url="$1" out="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 2 --max-time 600 -o "$out" "$url"
+    else
+        wget -q -T 60 -t 2 -O "$out" "$url"
+    fi
+}
+
+version_gt() { # version_gt <a> <b> : a строго больше b ?
+    [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" == "$1" && "$1" != "$2" ]]
+}
+
+ask_yes_no() { # ask_yes_no <вопрос> [default: y|n]
+    local q="$1" def="${2:-n}" ans
+    if (( YES )); then
+        return 0
+    fi
+    if [[ -e /dev/tty ]]; then
+        read -r -p "$q [y/n] (по умолчанию: $def) " ans </dev/tty || return 1
+    else
+        return 1
+    fi
+    [[ -z "$ans" ]] && ans="$def"
+    [[ "$ans" =~ ^[YyДд] ]]
+}
+
+###############################################################################
+# Установка через DNF
+###############################################################################
+
+run_install() { # run_install <logfile> <args...>
+    local logfile="$1"; shift
+    echo
+    echo "------------------------------------------------------------"
+    echo "DNF INSTALL"
+    echo "------------------------------------------------------------"
+    local rc=0
+    LC_ALL=C dnf install -y "$@" 2>&1 | tee "$logfile" || rc=${PIPESTATUS[0]}
+
+    # Локальные RPM без подписи: повторяем без gpg-проверки.
+    if (( rc != 0 )) && grep -qiE 'not signed|gpg check|no signature' "$logfile"; then
+        warn "Похоже, RPM не подписан — повторяю с --nogpgcheck"
+        LC_ALL=C dnf install -y --nogpgcheck "$@" 2>&1 | tee "${logfile%.log}-nogpg.log" || rc=${PIPESTATUS[0]}
+    fi
+    return "$rc"
+}
+
+extract_missing() { # extract_missing <logfile>
+    local logfile="$1"
+    grep -E 'nothing provides|ничто не предоставляет' "$logfile" \
+        | sed -E 's/.*(nothing provides|ничто не предоставляет)[[:space:]]+//' \
+        | sed -E 's/[[:space:]]*needed by.*//; s/[[:space:]]*необходимо для.*//' \
+        | sed -E 's/[[:space:]]+$//; /^$/d' \
+        | sort -u
+}
+
+classify_requirement() { # classify_requirement <req> — печатает тип
+    local req="$1"
+    case "$req" in
+        rpmlib\(*|rtld\(*|config\(*|/bin/sh) echo "internal"; return ;;
+        lib*.so*|*.so*)                      echo "soname" ;;
+        /*)                                  echo "path" ;;
+        *)                                   echo "package" ;;
+    esac
+}
+
+normalize_req_name() { # имя требования без «(…)» и без версий
+    printf '%s' "$1" \
+        | sed -E 's/\(\([^)]*\)\)//g; s/\([^)]+\)//g' \
+        | awk '{print $1}'
+}
+
+###############################################################################
+# Поиск и скачивание недостающих пакетов
+###############################################################################
+
+FAILED_REQ_FILE="$WORKDIR/failed-requirements.txt"
+: > "$FAILED_REQ_FILE"
+
+req_was_failed()  { grep -Fxq "$1" "$FAILED_REQ_FILE"; }
+req_mark_failed() { printf '%s\n' "$1" >> "$FAILED_REQ_FILE"; }
+
+rank_candidates() { # stdin: NEVRA ; stdout: свои arch/noarch — первыми, свежее — выше
+    awk -v A="$SYS_ARCH" '{
+        n=split($0, seg, ".");
+        arch=seg[n];
+        pri = (arch==A) ? 0 : ((arch=="noarch") ? 1 : 2);
+        printf "%d\t%s\n", pri, $0
+    }' | sort -t$'\t' -k1,1 -k2,2rV | awk -F'\t' '{print $2}'
+}
+
+find_providing_rpms() { # find_providing_rpms <req> <тип>
+    local req="$1" kind="$2" candidates=""
+
+    # Точный capability-поиск — единственный, который реально устроит DNF.
+    candidates="$(
+        LC_ALL=C dnf -q repoquery --available \
+            --arch="$SYS_ARCH,noarch" \
+            --whatprovides "$req" \
+            --queryformat '%{name}-%{epoch}:%{version}-%{release}.%{arch}' 2>/dev/null || true
+    )"
+
+    # Файловый поиск полезен только для требований-путей.
+    if [[ -z "$candidates" && "$kind" == "path" ]]; then
+        candidates="$(
+            LC_ALL=C dnf -q repoquery --available \
+                --arch="$SYS_ARCH,noarch" \
+                --whatprovides "*/$(basename "$req")" \
+                --queryformat '%{name}-%{epoch}:%{version}-%{release}.%{arch}' 2>/dev/null || true
+        )"
+    fi
+
+    [[ -z "$candidates" ]] && return 1
+    printf '%s\n' "$candidates" | sed '/^$/d' | rank_candidates
+}
+
+rpm_satisfies_req() { # rpm_satisfies_req <rpm> <req> <тип>
+    local rpmf="$1" req="$2" kind="$3" name
+    name="$(normalize_req_name "$req")"
+
+    if [[ "$kind" == "soname" ]]; then
+        rpm -qp --provides "$rpmf" 2>/dev/null | grep -qiF "$req" && return 0
+        return 1
+    fi
+
+    if [[ "$kind" == "path" ]]; then
+        rpm -qlp "$rpmf" 2>/dev/null \
+            | awk -F/ -v f="$(basename "$req")" '$NF == f {found=1} END {exit !found}'
+        return $?
+    fi
+
+    rpm -qp --provides "$rpmf" 2>/dev/null | grep -qiF "$name"
+}
+
+find_and_download() { # find_and_download <req>
+    local req="$1" kind name
+    kind="$(classify_requirement "$req")"
+
+    if [[ "$kind" == "internal" ]]; then
+        log "«$req» — внутреннее требование (rpmlib/rtld), из репозиториев не решается."
+        return 1
+    fi
+
+    name="$(normalize_req_name "$req")"
+    [[ -z "$name" ]] && { warn "Не удалось нормализовать: $req"; return 1; }
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "Поиск зависимости: $req   (тип: $kind)"
+    echo "------------------------------------------------------------"
+
+    # Уже скачанный RPM может закрывать это требование.
+    local existing
+    while IFS= read -r existing; do
+        [[ -z "$existing" ]] && continue
+        if rpm_satisfies_req "$existing" "$req" "$kind"; then
+            log "Уже скачан подходящий RPM: $(basename "$existing")"
+            return 0
+        fi
+    done < <(find "$DEPSDIR" -maxdepth 1 -type f -name '*.rpm' -print 2>/dev/null | sort)
+
+    local candidates
+    if ! candidates="$(find_providing_rpms "$req" "$kind")"; then
+        warn "В репозиториях нет ничего, что даёт «$req»"
+        req_mark_failed "$req"
+        return 1
+    fi
+
+    local tried=0 pkg before after newfile
+    while IFS= read -r pkg; do
+        [[ -z "$pkg" ]] && continue
+        (( tried >= 4 )) && break
+        tried=$((tried + 1))
+
+        log "Скачиваю кандидата: $pkg"
+        before="$(find "$DEPSDIR" -maxdepth 1 -type f -name '*.rpm' -print 2>/dev/null | sort)"
+
+        if ! LC_ALL=C dnf download --downloaddir="$DEPSDIR" "$pkg" >>"$LOGDIR/download.log" 2>&1; then
+            warn "dnf download не смог скачать $pkg"
+            continue
+        fi
+
+        after="$(find "$DEPSDIR" -maxdepth 1 -type f -name '*.rpm' -print 2>/dev/null | sort)"
+        newfile="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -n 1)"
+
+        if [[ -n "$newfile" ]] && rpm_satisfies_req "$newfile" "$req" "$kind"; then
+            log "Проверка OK: $(basename "$newfile") закрывает «$req»"
+            return 0
+        fi
+
+        warn "Кандидат $pkg не закрывает «$req» — пробую следующего"
+        [[ -n "$newfile" ]] && rm -f "$newfile"
+    done <<< "$candidates"
+
+    req_mark_failed "$req"
+    return 1
+}
+
+###############################################################################
+# Фаза 1: попытка скачать всё дерево зависимостей сразу
+###############################################################################
+
+PRIMARY_NAME="$(rpm -qp --qf '%{NAME}' "${INPUT_RPMS[0]}" 2>/dev/null || echo "")"
+
+log "Пробую dnf download --resolve (автоматическое дерево зависимостей)..."
+LC_ALL=C dnf download --resolve --downloaddir="$DEPSDIR" "${INPUT_RPMS[@]}" \
+    >"$LOGDIR/download-resolve.log" 2>&1 || {
+        log "dnf download --resolve не удался (не фатально):"
+        tail -n 5 "$LOGDIR/download-resolve.log" | sed 's/^/    /'
+    }
+
+# Убираем из deps RPM с тем же именем, что и исходный (иначе конфликт в транзакции).
+while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    if [[ "$(rpm -qp --qf '%{NAME}' "$f" 2>/dev/null || echo)" == "$PRIMARY_NAME" ]]; then
+        rm -f "$f"
+    fi
+done < <(find "$DEPSDIR" -maxdepth 1 -type f -name '*.rpm' -print)
+
+###############################################################################
+# Фаза 2: основной цикл установки
+###############################################################################
+
+MAX_ROUNDS=20
+round=1
+LAST_LOG=""
+DNF_RESULT=""   # ok | fail | limit
+
+while (( round <= MAX_ROUNDS )); do
+    LOGFILE="$LOGDIR/install-${round}.log"
+    LAST_LOG="$LOGFILE"
+
+    echo
+    echo
+    echo "################################################################"
+    echo "# Попытка установки №$round"
+    echo "################################################################"
+
+    mapfile -t LOCAL_RPMS < <(find "$DEPSDIR" -maxdepth 1 -type f -name '*.rpm' -print | sort)
+    INSTALL_ARGS=("${INPUT_RPMS[@]}")
+    (( ${#LOCAL_RPMS[@]} > 0 )) && INSTALL_ARGS+=("${LOCAL_RPMS[@]}")
+
+    log "Пакетов в транзакции: ${#INSTALL_ARGS[@]}"
+
+    if run_install "$LOGFILE" "${INSTALL_ARGS[@]}"; then
+        DNF_RESULT="ok"
+        echo
+        log "Установка через DNF завершена (в т.ч. случай «уже установлен»)."
+        break
+    fi
+
+    echo
+    log "DNF не смог завершить установку."
+
+    mapfile -t MISSING < <(extract_missing "$LOGFILE")
+    if (( ${#MISSING[@]} == 0 )) && [[ -f "${LOGFILE%.log}-nogpg.log" ]]; then
+        mapfile -t MISSING < <(extract_missing "${LOGFILE%.log}-nogpg.log")
+    fi
+
+    if (( ${#MISSING[@]} == 0 )); then
+        echo
+        warn "Не удалось определить отсутствующие зависимости из вывода DNF."
+        echo "Последние строки лога:"
+        tail -n 40 "$LOGFILE" | sed 's/^/    /'
+        echo "Полный лог: $LOGFILE"
+        break
+    fi
+
+    echo
+    log "Найдены отсутствующие зависимости:"
+    for req in "${MISSING[@]}"; do
+        echo "  - $req"
+    done
+
+    found_something_new=0
+    for req in "${MISSING[@]}"; do
+        if req_was_failed "$req"; then
+            log "«$req» уже безуспешно искали ранее — пропускаю."
+            continue
+        fi
+        if find_and_download "$req"; then
+            found_something_new=1
+        else
+            echo "Не удалось найти RPM для: $req"
+        fi
+    done
+
+    if (( found_something_new == 0 )); then
+        echo
+        echo "============================================================"
+        echo "Репозитории исчерпаны — переход к анализу пакета."
+        echo "============================================================"
+        break
+    fi
+
+    round=$((round + 1))
+done
+
+if (( round > MAX_ROUNDS )); then
+    warn "Достигнут лимит попыток ($MAX_ROUNDS)."
+    DNF_RESULT="limit"
+fi
+[[ -z "$DNF_RESULT" ]] && DNF_RESULT="fail"
+
+###############################################################################
+# Фаза 3: анализ пакета — какие зависимости РЕАЛЬНЫЕ
+###############################################################################
+
+echo
+echo "################################################################"
+echo "# Анализ ELF-файлов пакета"
+echo "################################################################"
+
+rm -rf "$INSPECTDIR"
+mkdir -p "$INSPECTDIR"
+cd "$INSPECTDIR"
+
+for rp in "${INPUT_RPMS[@]}"; do
+    rpm2cpio "$rp" | cpio -idm --quiet 2>/dev/null || true
+done
+
+# ELF-файлы пакета (пути — как в пакете, т.е. абсолютные)
+mapfile -t ELF_FILES < <(
+    find . -type f -exec file {} + 2>/dev/null | grep ELF | cut -d: -f1 | sed 's/^\.//'
+)
+(( ${#ELF_FILES[@]} > 0 )) || die "В пакете не найдено ELF-файлов — автоматический анализ невозможен."
+
+# Системные soname
+declare -A SYSTEM_SONAMES=()
+while IFS= read -r line; do
+    s="$(printf '%s' "$line" | awk -F'(' '{print $1}' | awk '{print $1}')"
+    [[ -n "$s" ]] && SYSTEM_SONAMES["$s"]=1
+done < <(ldconfig -p 2>/dev/null | grep -E '\.so')
+for d in /usr/lib64 /lib64 /usr/lib /lib /usr/lib/x86_64-linux-gnu; do
+    [[ -d "$d" ]] || continue
+    while IFS= read -r s; do
+        SYSTEM_SONAMES["$(basename "$s")"]=1
+    done < <(find "$d" -maxdepth 1 -name '*.so*' -print 2>/dev/null)
+done
+
+# Комплектные soname — всё, что едет внутри RPM
+declare -A BUNDLED_SONAMES=()
+while IFS= read -r f; do
+    BUNDLED_SONAMES["$(basename "$f")"]=1
+done < <(find . -type f -print 2>/dev/null)
+
+# Общий корень приложения (общий предок всех ELF-путей)
+APP_ROOT="$(printf '%s\n' "${ELF_FILES[@]}" | awk -F/ '
+    NR==1 { deep=NF; for(i=1;i<=NF;i++) comp[i]=$i; next }
+    { n=NF; if (n<deep) deep=n;
+      for(i=2;i<=deep;i++) if ($i != comp[i]) { deep=i-1; break } }
+    END { out=""; for(i=1;i<=deep;i++) out=out (i==1?"":"/") $i; print (out==""?"/":out) }')"
+case "$APP_ROOT" in
+    /|/usr|/etc|/var|/opt|/bin|/sbin) APP_ROOT="/opt/.smart-runtime-${PRIMARY_NAME:-app}" ;;
+esac
+
+# Анализ каждого ELF
+declare -A ELF_DYNAMIC=()
+declare -A ELF_EXEC=()
+declare -a REAL_MISSING=()
+declare -a OPTIONAL_MISSING=()
+GLIBC_NEEDED_MAX=""
+GLIBCXX_NEEDED_MAX=""
+
+ELF_REPORT="$WORKDIR/elf-report.tsv"
+LIBDIRS_RAW="$WORKDIR/libdirs.txt"
+printf 'path\tdynamic\texec\tmax_glibc\tmax_glibcxx\n' > "$ELF_REPORT"
+: > "$LIBDIRS_RAW"
+
+for elf in "${ELF_FILES[@]}"; do
+    full="./$elf"
+    [[ -f "$full" ]] || full="$elf"
+
+    interp="$(LC_ALL=C readelf -l "$full" 2>/dev/null | grep -c 'INTERP' || true)"
+    dyn=0; (( interp > 0 )) && dyn=1
+    ELF_DYNAMIC["$elf"]=$dyn
+
+    # Исполняемый файл? (у DSO тоже бывает PT_INTERP — доверяем file)
+    ftype="$(file -b "$full" 2>/dev/null || true)"
+    ex=0; [[ "$ftype" == *executable* ]] && ex=1
+    ELF_EXEC["$elf"]=$ex
+
+    # Каталоги настоящих DSO (не exe, не bin-каталоги) — для LIBDIR
+    if [[ "$ftype" == *shared\ object* && "$ftype" != *executable* ]]; then
+        printf '%s\n' "$(dirname "$elf")" >> "$LIBDIRS_RAW"
+    fi
+
+    maxg="$(objdump -T "$full" 2>/dev/null | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tail -n 1 || true)"
+    maxx="$(objdump -T "$full" 2>/dev/null | grep -oE 'GLIBCXX_3\.4(\.[0-9]+)?' | sort -uV | tail -n 1 || true)"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$elf" "$dyn" "$ex" "$maxg" "$maxx" >> "$ELF_REPORT"
+
+    if [[ -n "$maxg" ]]; then
+        [[ -z "$GLIBC_NEEDED_MAX" ]] && GLIBC_NEEDED_MAX="$maxg"
+        if version_gt "${maxg#GLIBC_}" "${GLIBC_NEEDED_MAX#GLIBC_}"; then
+            GLIBC_NEEDED_MAX="$maxg"
+        fi
+    fi
+    if [[ -n "$maxx" ]]; then
+        [[ -z "$GLIBCXX_NEEDED_MAX" ]] && GLIBCXX_NEEDED_MAX="$maxx"
+        if version_gt "${maxx#GLIBCXX_}" "${GLIBCXX_NEEDED_MAX#GLIBCXX_}"; then
+            GLIBCXX_NEEDED_MAX="$maxx"
+        fi
+    fi
+
+    # Плагины (*/plugins/*) загружаются через dlopen и опциональны:
+    # недостающие у них библиотеки не блокируют установку.
+    case "$elf" in
+        */plugins/*) is_plugin=1 ;;
+        *)           is_plugin=0 ;;
+    esac
+
+    while IFS= read -r need; do
+        [[ -z "$need" ]] && continue
+        if [[ -z "${BUNDLED_SONAMES[$need]:-}" && -z "${SYSTEM_SONAMES[$need]:-}" ]]; then
+            already_listed=0
+            if (( is_plugin )); then
+                for m in "${OPTIONAL_MISSING[@]:-}"; do
+                    [[ "$m" == "$need" ]] && { already_listed=1; break; }
+                done
+                (( already_listed )) || OPTIONAL_MISSING+=("$need")
+            else
+                for m in "${REAL_MISSING[@]:-}"; do
+                    [[ "$m" == "$need" ]] && { already_listed=1; break; }
+                done
+                (( already_listed )) || REAL_MISSING+=("$need")
+            fi
+        fi
+    done < <(LC_ALL=C readelf -d "$full" 2>/dev/null | awk '/NEEDED/{gsub(/.*\[|\]/,""); print $0}')
+done
+
+# Каталог комплектных библиотек: общий предок каталогов с DSO
+# (bin-каталоги исключаем: в них бывают *.so вроде libtun2proxy.so,
+# из-за которых «общий предок» уезжает выше /lib).
+LIBDIR="$(sort -u "$LIBDIRS_RAW" | grep -Ev '/(bin|sbin|libexec)(/|$)' \
+    | awk -F/ '
+        NR==1 { deep=NF; for(i=1;i<=NF;i++) comp[i]=$i; next }
+        { n=NF; if (n<deep) deep=n;
+          for(i=2;i<=deep;i++) if ($i != comp[i]) { deep=i-1; break } }
+        END { out=""; for(i=1;i<=deep;i++) out=out (i==1?"":"/") $i; print (out==""?"/":out) }')"
+LIBDIR="${LIBDIR:-/opt/${PRIMARY_NAME:-app}/lib}"
+
+SYSTEM_STDCXX="$(find /usr/lib64 /lib64 /usr/lib -maxdepth 2 -name 'libstdc++.so.6' 2>/dev/null | head -n 1)"
+GLIBCXX_SYS_VER="0"
+if [[ -n "$SYSTEM_STDCXX" ]]; then
+    GLIBCXX_SYS_VER="$(strings "$SYSTEM_STDCXX" 2>/dev/null | grep -oE 'GLIBCXX_3\.4(\.[0-9]+)?' | sort -uV | tail -n 1)"
+    GLIBCXX_SYS_VER="${GLIBCXX_SYS_VER#GLIBCXX_}"
+fi
+
+GLIBC_NEEDED_VER="${GLIBC_NEEDED_MAX#GLIBC_}"
+GLIBCXX_NEEDED_VER="${GLIBCXX_NEEDED_MAX#GLIBCXX_}"
+
+GLIBC_SHORT=0
+GLIBCXX_SHORT=0
+[[ -n "$GLIBC_NEEDED_VER" ]] && version_gt "$GLIBC_NEEDED_VER" "$GLIBC_SYS" && GLIBC_SHORT=1 || GLIBC_SHORT=0
+[[ -n "$GLIBCXX_NEEDED_VER" ]] && version_gt "$GLIBCXX_NEEDED_VER" "$GLIBCXX_SYS_VER" && GLIBCXX_SHORT=1 || GLIBCXX_SHORT=0
+
+echo
+echo "ELF-файлов в пакете : ${#ELF_FILES[@]}"
+echo "Нужен glibc         : ${GLIBC_NEEDED_VER:-нет}  (в системе: $GLIBC_SYS)"
+echo "Нужен GLIBCXX       : ${GLIBCXX_NEEDED_VER:-нет}  (в системе: $GLIBCXX_SYS_VER)"
+echo "Библиотеки, отсутствующие и в пакете, и в системе:"
+if (( ${#REAL_MISSING[@]} > 0 )); then
+    for m in "${REAL_MISSING[@]}"; do echo "  - $m"; done
+else
+    echo "  (нет)"
+fi
+if [[ ${#OPTIONAL_MISSING[@]} -gt 0 ]]; then
+    echo "Опциональные (плагины, dlopen — не блокируют запуск):"
+    for m in "${OPTIONAL_MISSING[@]}"; do echo "  - $m"; done
+fi
+
+cd "$WORKDIR"
+
+###############################################################################
+# Фаза 4: аварийная установка (rpm --nodeps), если это безопасно
+###############################################################################
+
+bundle_covers() { # что покрывает приватный рантайм (Ubuntu 22.04)
+    case "$1" in
+        libc.so.6|libm.so.6|libmvec.so.1|libpthread.so.0|libdl.so.2|librt.so.1|\
+        libresolv.so.2|libutil.so.1|libanl.so.1|libnsl.so.1|libnss_files.so.2|\
+        libnss_dns.so.2|libnss_compat.so.2|libnss_hesiod.so.2|ld-linux-x86-64.so.2|\
+        libgcc_s.so.1|libstdc++.so.6|libssl.so.3|libcrypto.so.3) return 0 ;;
+        glibc) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+UNRESOLVED_COUNT=0
+while IFS= read -r line; do
+    [[ -n "$line" ]] && UNRESOLVED_COUNT=$((UNRESOLVED_COUNT + 1))
+done < "$FAILED_REQ_FILE"
+
+REAL_MISSING_COUNT=0
+for m in "${REAL_MISSING[@]:-}"; do
+    [[ -n "$m" ]] && REAL_MISSING_COUNT=$((REAL_MISSING_COUNT + 1))
+done
+
+need_nodeps=0
+(( UNRESOLVED_COUNT > 0 )) && need_nodeps=1
+(( REAL_MISSING_COUNT > 0 )) && need_nodeps=1
+(( GLIBC_SHORT || GLIBCXX_SHORT )) && need_nodeps=1
+
+NEED_RUNTIME=0
+(( GLIBC_SHORT || GLIBCXX_SHORT )) && NEED_RUNTIME=1
+
+# Случай «DNF уже установил пакет» (повторный запуск): ремонт обёрток/рантайма
+# всё равно нужен, если анализ показывает нехватку glibc.
+if [[ "$DNF_RESULT" == "ok" ]]; then
+    uncoverable=0
+    for m in "${REAL_MISSING[@]:-}"; do
+        [[ -z "$m" ]] && continue
+        if ! bundle_covers "$m"; then
+            uncoverable=1
+            warn "«$m» не покрывается рантайм-бандлом — приложение может не работать."
+        fi
+    done
+    if (( NEED_RUNTIME == 0 && REAL_MISSING_COUNT == 0 )); then
+        echo
+        echo "============================================================"
+        echo "ГОТОВО ✅"
+        echo "DNF установил пакет(ы); совместимый рантайм не требуется."
+        echo "Попыток: $round"
+        echo "============================================================"
+        exit 0
+    fi
+    if (( ! RUNTIME_BUNDLE )); then
+        echo
+        echo "Пакет уже установлен, но по анализу нужен приватный рантайм"
+        echo "(glibc ${GLIBC_NEEDED_VER:-?} / GLIBCXX ${GLIBCXX_NEEDED_VER:-?} против системных $GLIBC_SYS / $GLIBCXX_SYS_VER)."
+        if ask_yes_no "Развернуть приватный рантайм (Ubuntu 22.04)?" "y"; then
+            RUNTIME_BUNDLE=1
+        else
+            warn "Без рантайма приложение, скорее всего, не запустится."
+        fi
+    fi
+else
+    if (( ! need_nodeps )); then
+        die "Аварийная установка не требуется, но DNF её не выполнил — смотри логи: $LAST_LOG"
+    fi
+
+    # Всё ли отсутствующее покрывается рантайм-бандлом?
+    uncoverable=0
+    for m in "${REAL_MISSING[@]:-}"; do
+        [[ -z "$m" ]] && continue
+        if ! bundle_covers "$m"; then
+            uncoverable=1
+            warn "Библиотека «$m» не покрывается рантайм-бандлом."
+        fi
+    done
+    (( uncoverable )) && die "Есть зависимости, которые нельзя закрыть автоматически. Прервано."
+
+    echo
+    echo "Заявленные зависимости, которые не закрыл DNF: $UNRESOLVED_COUNT"
+    echo "Реально отсутствующие библиотеки:              $REAL_MISSING_COUNT"
+    echo "Нужен более новый glibc/libstdc++:             $(( GLIBC_SHORT || GLIBCXX_SHORT ? 1 : 0 ))"
+    echo
+
+    if (( ! ALLOW_NODEPS )); then
+        echo "Дальнейший путь — установка через rpm --nodeps:"
+        echo "анализ выше показывает, что заявленные зависимости пакета либо ложные,"
+        echo "либо закрываются приватным рантаймом приложения."
+        if ask_yes_no "Продолжить с rpm --nodeps?" "n"; then
+            ALLOW_NODEPS=1
+        else
+            die "Отменено пользователем."
+        fi
+    fi
+
+    if (( (GLIBC_SHORT || GLIBCXX_SHORT) && ! RUNTIME_BUNDLE )); then
+        echo
+        echo "Пакету нужен glibc ${GLIBC_NEEDED_VER:-?} / GLIBCXX ${GLIBCXX_NEEDED_VER:-?},"
+        echo "а в системе glibc $GLIBC_SYS / GLIBCXX $GLIBCXX_SYS_VER."
+        echo "Без приватного рантайма приложение, скорее всего, не запустится."
+        if ask_yes_no "Установить приватный рантайм (Ubuntu 22.04)?" "y"; then
+            RUNTIME_BUNDLE=1
+        fi
+    fi
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "Установка через rpm (nodeps)"
+    echo "------------------------------------------------------------"
+    INSTALL_RC=0
+    for rp in "${INPUT_RPMS[@]}"; do
+        rpm -Uvh --nodeps --replacepkgs "$rp" 2>&1 | tee "$LOGDIR/rpm-nodeps.log" || INSTALL_RC=1
+    done
+    (( INSTALL_RC == 0 )) || die "rpm --nodeps не смог установить пакет. Лог: $LOGDIR/rpm-nodeps.log"
+
+    command -v ldconfig >/dev/null 2>&1 && ldconfig 2>/dev/null || true
+fi
+
+###############################################################################
+# Фаза 5: приватный рантайм
+###############################################################################
+
+RT_ROOT="$APP_ROOT/.smart-runtime"
+RT_LD=""
+
+if (( RUNTIME_BUNDLE )); then
+    echo
+    echo "################################################################"
+    echo "# Приватный рантайм: $RT_ROOT"
+    echo "################################################################"
+
+    UBUNTU_BASE="${UBUNTU_BASE:-http://archive.ubuntu.com/ubuntu}"
+    DEBLIST=(libc6 libgcc-s1 libstdc++6 libssl3)
+    DEBDIR="$WORKDIR/runtime-debs"
+    mkdir -p "$DEBDIR" "$RT_ROOT"
+
+    PKGIDX="$DEBDIR/Packages.gz"
+    idx_ok=0
+    for suite in jammy-updates jammy; do
+        if fetch "$UBUNTU_BASE/dists/$suite/main/binary-amd64/Packages.gz" "$PKGIDX" 2>/dev/null; then
+            idx_ok=1
+            break
+        fi
+    done
+    (( idx_ok )) || die "Не удалось получить индекс Ubuntu ($UBUNTU_BASE)."
+
+    log "Индекс Ubuntu получен — ищу пакеты: ${DEBLIST[*]}"
+
+    declare -A DEB_URL=()
+    while read -r pkg fn; do
+        [[ -n "$pkg" && -n "$fn" ]] && DEB_URL["$pkg"]="$UBUNTU_BASE/$fn"
+    done < <(zcat "$PKGIDX" | awk -v RS= -v want_list="${DEBLIST[*]}" '
+        BEGIN { n=split(want_list, w, " "); for(i=1;i<=n;i++) want[w[i]]=1 }
+        {
+            pkg=""; fn=""
+            c=split($0, L, "\n")
+            for(i=1;i<=c;i++) {
+                if (L[i] ~ /^Package: /)  pkg=substr(L[i],10)
+                if (L[i] ~ /^Filename: /) fn=substr(L[i],10)
+            }
+            if (pkg in want && fn != "") print pkg, fn
+        }')
+
+    DEBS_OK=1
+    for p in "${DEBLIST[@]}"; do
+        u="${DEB_URL[$p]:-}"
+        [[ -n "$u" ]] || { warn "Не найден в индексе: $p"; DEBS_OK=0; continue; }
+        out="$DEBDIR/$(basename "$u")"
+        if [[ -s "$out" ]]; then
+            log "Уже скачан: $(basename "$u")"
+        else
+            log "Скачиваю: $(basename "$u")"
+            if ! fetch "$u" "$out"; then
+                warn "Не скачался: $u"
+                DEBS_OK=0
+                continue
+            fi
+        fi
+        member="$(ar t "$out" | grep -E '^data\.tar\.(zst|xz|gz|bz2)$' | head -n 1)"
+        [[ -n "$member" ]] || { warn "Нет data.tar в $out"; DEBS_OK=0; continue; }
+        case "$member" in
+            *.zst) ar p "$out" "$member" | zstd -dc | tar -xf - -C "$RT_ROOT" ;;
+            *.xz)  ar p "$out" "$member" | tar -xJ  -C "$RT_ROOT" ;;
+            *.gz)  ar p "$out" "$member" | tar -xz  -C "$RT_ROOT" ;;
+            *.bz2) ar p "$out" "$member" | tar -xj  -C "$RT_ROOT" ;;
+        esac
+    done
+    (( DEBS_OK )) || die "Не все компоненты рантайма получены."
+
+    RT_LD="$RT_ROOT/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+    [[ -f "$RT_LD" ]] || RT_LD="$RT_ROOT/lib64/ld-linux-x86-64.so.2"
+    [[ -f "$RT_LD" ]] || die "Не найден ld-linux в рантайме."
+    RT_LIBS="$RT_ROOT/lib/x86_64-linux-gnu:$RT_ROOT/usr/lib/x86_64-linux-gnu"
+
+    # Debian-раскладка (/usr/lib/x86_64-linux-gnu, /lib/x86_64-linux-gnu):
+    # эти каталоги входят в пути поиска ПРИВАТНОГО ld-linux (Ubuntu),
+    # но НЕ системного (ROSA ищет только в /lib64, /usr/lib64). Через них
+    # приватный загрузчик находит glibc/gcc/ssl БЕЗ переменных окружения —
+    # поэтому дочерние процессы приложения никогда не видят чужую libc.
+    ENV_FALLBACK=0
+    SYSTEM_LINKS="$WORKDIR/system-links.txt"
+    : > "$SYSTEM_LINKS"
+    ensure_private_libdir() { # <system_path> <target>
+        local p="$1" t="$2"
+        if [[ -L "$p" || ! -e "$p" ]]; then
+            ln -sfn "$t" "$p" || return 1
+        else
+            return 1
+        fi
+        printf '%s -> %s\n' "$p" "$t" >> "$SYSTEM_LINKS"
+    }
+    if ! ensure_private_libdir /usr/lib/x86_64-linux-gnu "$RT_ROOT/usr/lib/x86_64-linux-gnu"; then
+        warn "/usr/lib/x86_64-linux-gnu занят — включаю LD_LIBRARY_PATH fallback"
+        ENV_FALLBACK=1
+    fi
+    if ! ensure_private_libdir /lib/x86_64-linux-gnu "$RT_ROOT/lib/x86_64-linux-gnu"; then
+        warn "/lib/x86_64-linux-gnu занят — включаю LD_LIBRARY_PATH fallback"
+        ENV_FALLBACK=1
+    fi
+
+    # Копия приватных библиотек в каталог bundled-библиотек ($LIBDIR):
+    # его первыми просматривает DT_RUNPATH бинарей ($ORIGIN/../lib),
+    # который СТАРШЕ системного ld.so.cache. Без этого приватный ld
+    # получит системную libc из кэша и упадёт на GLIBC_2.34.
+    LIBS_TO_COPY="libc.so.6 libm.so.6 libmvec.so.1 libpthread.so.0 libdl.so.2 librt.so.1 libresolv.so.2 libutil.so.1 libanl.so.1 libnsl.so.1 libBrokenLocale.so.1 libthread_db.so.1 libc_malloc_debug.so.0 libnss_files.so.2 libnss_dns.so.2 libnss_compat.so.2 libnss_hesiod.so.2 libgcc_s.so.1 libstdc++.so.6 libssl.so.3 libcrypto.so.3"
+    for base in $LIBS_TO_COPY; do
+        for src in "$RT_ROOT/lib/x86_64-linux-gnu" "$RT_ROOT/usr/lib/x86_64-linux-gnu"; do
+            if [[ -e "$src/$base" ]]; then
+                cp -aL "$src/$base" "$LIBDIR/$base" 2>/dev/null || true
+                break
+            fi
+        done
+    done
+    [[ -d "$RT_ROOT/usr/lib/x86_64-linux-gnu/gconv" ]] && \
+        cp -a "$RT_ROOT/usr/lib/x86_64-linux-gnu/gconv" "$LIBDIR/gconv" 2>/dev/null || true
+
+    log "Рантайм развёрнут: $(du -sh "$RT_ROOT" 2>/dev/null | awk '{print $1}')"
+fi
+
+###############################################################################
+# Фаза 6: обёртки для динамических бинарников
+###############################################################################
+
+WRAPPED_LIST="$WORKDIR/wrapped.list"
+: > "$WRAPPED_LIST"
+
+if [[ -n "$RT_LD" ]]; then
+    echo
+    echo "------------------------------------------------------------"
+    echo "Заворачиваю динамические бинарники в обёртки"
+    echo "------------------------------------------------------------"
+
+    # Короткий симлинк на приватный ld-linux: его пропишем прямо в PT_INTERP
+    # бинарников (короткий, чтобы влез в исходный сегмент интерпретатора).
+    LD_LINK="$APP_ROOT/.ld64"
+    ln -sfn "$RT_LD" "$LD_LINK"
+
+    # Останавливаем сервисы пакета ДО патча бинарников: запись в
+    # исполняемый файл работающего процесса даёт «Text file busy».
+    # Перезапуск — после заворачивания (см. ниже).
+    for rp in "${INPUT_RPMS[@]}"; do
+        while IFS= read -r unit; do
+            case "$unit" in
+                */systemd/system/*.service)
+                    unit_name="$(basename "$unit")"
+                    if systemctl is-active --quiet "$unit_name" 2>/dev/null; then
+                        log "Остановка сервиса перед патчем: $unit_name"
+                        systemctl stop "$unit_name" 2>/dev/null || true
+                    fi
+                    ;;
+            esac
+        done < <(rpm -qlp "$rp" 2>/dev/null)
+    done
+
+    # Патчер PT_INTERP (idempotentный, минимальная правка in-place).
+    PATCHER="$WORKDIR/patch_interp.py"
+    cat > "$PATCHER" <<'PYEOF'
+import struct, sys
+path, new_interp = sys.argv[1], sys.argv[2]
+data = bytearray(open(path, 'rb').read())
+if data[:4] != b'\x7fELF':
+    print("NOT_ELF"); sys.exit(3)
+e_phoff    = struct.unpack_from('<Q', data, 0x20)[0]
+e_phentsize= struct.unpack_from('<H', data, 0x36)[0]
+e_phnum    = struct.unpack_from('<H', data, 0x38)[0]
+for i in range(e_phnum):
+    off = e_phoff + i * e_phentsize
+    if struct.unpack_from('<I', data, off)[0] != 3:   # PT_INTERP
+        continue
+    p_offset = struct.unpack_from('<Q', data, off + 8)[0]
+    p_filesz = struct.unpack_from('<Q', data, off + 16)[0]
+    old = bytes(data[p_offset:p_offset + p_filesz]).split(b'\0')[0].decode('utf-8', 'replace')
+    if old == new_interp:
+        print("ALREADY " + old); sys.exit(0)
+    # Пишем строго длину старой строки + NUL: сегмент interp может содержать
+    # данные ПОСЛЕ строки (p_filesz >> длины пути) — затирать его нельзя!
+    nb = new_interp.encode() + b'\0'
+    old_len = len(old) + 1
+    if len(nb) > old_len:
+        print("TOO_LONG %d > %d" % (len(nb), old_len)); sys.exit(2)
+    data[p_offset:p_offset + old_len] = nb + b'\0' * (old_len - len(nb))
+    open(path, 'wb').write(data)
+    print("PATCHED %s -> %s" % (old, new_interp)); sys.exit(0)
+print("NO_INTERP"); sys.exit(3)
+PYEOF
+
+    for elf in "${ELF_FILES[@]}"; do
+        # Заворачиваем только исполняемые файлы (DSO с PT_INTERP — не трогаем!)
+        (( ${ELF_DYNAMIC[$elf]:-0} == 1 && ${ELF_EXEC[$elf]:-0} == 1 )) || continue
+
+        real_path="$elf"          # абсолютный путь, как в пакете
+        [[ -f "$real_path" ]] || continue
+
+        is_script=0
+        head -c 2 "$real_path" 2>/dev/null | grep -q '#!' && is_script=1
+
+        if [[ -f "$real_path.orig" ]]; then
+            if (( is_script )); then
+                log "Уже обёрнут ранее: $real_path (обновляю только обёртку)"
+            else
+                # После повторной установки rpm вернул свежий бинарник —
+                # обновляем .orig
+                mv -f "$real_path" "$real_path.orig"
+                log "Обновлён: $real_path.orig"
+            fi
+        elif (( is_script )); then
+            warn "$real_path — обёртка без .orig, пропускаю."
+            continue
+        else
+            mv -f "$real_path" "$real_path.orig"
+        fi
+
+        # PT_INTERP -> приватный ld-linux: /proc/self/exe остаётся настоящим
+        # бинарником, поэтому applicationDirPath(), qt.conf и относительные
+        # пути (core/xray) работают как задумано.
+        if ! python3 "$PATCHER" "$real_path.orig" "$LD_LINK" >> "$LOGDIR/interp-patch.log" 2>&1; then
+            warn "PT_INTERP не пропатчен: $real_path.orig (см. interp-patch.log)"
+        fi
+
+        # DT_RUNPATH -> DT_RPATH: RUNPATH покрывает лишь прямые зависимости
+        # бинаря, а RPATH наследуется на ВСЕ загрузки процесса. Без этого
+        # транзитивные glibc-зависимости комплектных библиотек (например,
+        # libpthread у libQt6Core) уходят в /etc/ld.so.cache за системной
+        # libc и роняют процесс (GLIBC_PRIVATE).
+        RPATH_FIXER="$WORKDIR/rpath_swap.py"
+        if [[ ! -f "$RPATH_FIXER" ]]; then
+            cat > "$RPATH_FIXER" <<'PYEOF'
+import struct, sys
+RPATH = sys.argv[2].encode() + b"\0"
+data = bytearray(open(sys.argv[1], 'rb').read())
+assert data[:4] == b'\x7fELF' and data[4] == 2 and data[5] == 1
+phoff = struct.unpack_from('<Q', data, 0x20)[0]
+phentsize, phnum = struct.unpack_from('<HH', data, 0x36)
+dyn_off = dyn_sz = None; loads = []
+for i in range(phnum):
+    b = phoff + i * phentsize
+    ptype = struct.unpack_from('<I', data, b)[0]
+    off, vaddr, paddr, filesz = struct.unpack_from('<QQQQ', data, b + 8)
+    if ptype == 2: dyn_off, dyn_sz = off, filesz
+    if ptype == 1: loads.append((vaddr, off, filesz))
+if dyn_off is None: print("NO_DYNAMIC"); sys.exit(0)
+def v2o(v):
+    for va, o, fs in loads:
+        if va <= v < va + fs: return v - va + o
+def in_load(v): return any(va <= v < va + fs for va, o, fs in loads)
+ents = range(dyn_off, dyn_off + dyn_sz - 16, 16)
+tags = [struct.unpack_from('<Q', data, e)[0] for e in ents]
+if 15 in tags: print("HAS_RPATH"); sys.exit(0)
+if 29 in tags:
+    e = dyn_off + tags.index(29) * 16
+    struct.pack_into('<Q', data, e, 15)
+    print("SWAPPED RUNPATH->RPATH"); open(sys.argv[1], 'wb').write(data); sys.exit(0)
+e5 = dyn_off + tags.index(5) * 16
+strtab_va = struct.unpack_from('<Q', data, e5 + 8)[0]
+shoff = struct.unpack_from('<Q', data, 0x28)[0]
+shentsize, shnum = struct.unpack_from('<HH', data, 0x3A)
+ds = None
+for i in range(shnum):
+    s = shoff + i * shentsize
+    if struct.unpack_from('<I', data, s + 4)[0] != 3: continue
+    if struct.unpack_from('<Q', data, s + 16)[0] == strtab_va: ds = s
+if ds is None: print("NO_DYNSTR"); sys.exit(4)
+ds_off = struct.unpack_from('<Q', data, ds + 24)[0]
+ds_size = struct.unpack_from('<Q', data, ds + 32)[0]
+ds_va = struct.unpack_from('<Q', data, ds + 16)[0]
+nxt = min((struct.unpack_from('<Q', data, shoff + i * shentsize + 24)[0]
+           for i in range(shnum)
+           if struct.unpack_from('<Q', data, shoff + i * shentsize + 24)[0] >= ds_off + ds_size
+           and shoff + i * shentsize != ds), default=ds_off + ds_size)
+if nxt - (ds_off + ds_size) < len(RPATH) or not in_load(ds_va + ds_size):
+    print("NO_ROOM"); sys.exit(4)
+data[ds_off + ds_size:ds_off + ds_size + len(RPATH)] = RPATH
+e0 = dyn_off + tags.index(0) * 16
+struct.pack_into('<QQ', data, e0, 15, ds_size)
+open(sys.argv[1], 'wb').write(data)
+print("INJECTED RPATH"); sys.exit(0)
+PYEOF
+        fi
+        if ! python3 "$RPATH_FIXER" "$real_path.orig" "$LIBDIR" >> "$LOGDIR/interp-patch.log" 2>&1; then
+            command -v patchelf >/dev/null 2>&1 || \
+                dnf -q -y install patchelf >/dev/null 2>&1 || true
+            if command -v patchelf >/dev/null 2>&1; then
+                patchelf --force-rpath --set-rpath "$LIBDIR" "$real_path.orig" \
+                    >> "$LOGDIR/interp-patch.log" 2>&1 \
+                    || warn "RPATH не установлен: $real_path.orig"
+            else
+                warn "RPATH не установлен (нет patchelf): $real_path.orig"
+            fi
+        fi
+
+        # LD_LIBRARY_PATH не экспортируем принципиально: библиотеки доступны
+        # приватному ld через симлинки Debian-раскладки и RPATH бинарей.
+        # Иначе окружение «протекает» в дочерние системные процессы (sh и пр.),
+        # и системный ld 2.33 получает приватную libc 2.35 — SEGV.
+        env_line=""
+        if (( ENV_FALLBACK )); then
+            env_line="export LD_LIBRARY_PATH=\"$RT_LIBS\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}\""
+        fi
+
+        cat > "$real_path" <<EOF
+#!/bin/sh
+# Обёртка создана smart-dnf-install v$SCRIPT_VERSION.
+# Оригинальный бинарник: $real_path.orig
+# (его PT_INTERP указывает на $LD_LINK — приватный ld-linux,
+#  поэтому /proc/self/exe и все относительные пути работают правильно).
+RT_ROOT="$RT_ROOT"
+APP_BIN_DIR="\$(dirname "\$0")"
+APP_BIN_DIR=\$(cd "\$APP_BIN_DIR" && pwd)
+cd "\$APP_BIN_DIR" || exit 1
+export PATH="\$APP_BIN_DIR:\$APP_BIN_DIR/core:\$PATH"
+$env_line
+export GCONV_PATH="\$RT_ROOT/usr/lib/x86_64-linux-gnu/gconv"
+export LANG="\${LANG:-C.UTF-8}"
+export QT_PLUGIN_PATH="$LIBDIR/plugins\${QT_PLUGIN_PATH:+:\$QT_PLUGIN_PATH}"
+export QML2_IMPORT_PATH="$LIBDIR/qml\${QML2_IMPORT_PATH:+:\$QML2_IMPORT_PATH}"
+exec "$real_path.orig" "\$@"
+EOF
+        chmod +x "$real_path"
+        printf '%s\n' "$real_path" >> "$WRAPPED_LIST"
+        log "Обёртка: $real_path -> $(basename "$real_path").orig"
+    done
+
+    # Убираем .orig у файлов, которые обёртками не стали
+    # (например, после исправления классификации).
+    for elf in "${ELF_FILES[@]}"; do
+        real_path="$elf"
+        [[ -f "$real_path.orig" ]] || continue
+        if ! grep -Fxq "$real_path" "$WRAPPED_LIST"; then
+            if head -c 2 "$real_path" 2>/dev/null | grep -q '#!'; then
+                mv -f "$real_path.orig" "$real_path"
+                log "Восстановлен: $real_path (обёртка не требуется)"
+            else
+                rm -f "$real_path.orig"
+                log "Убран устаревший: $real_path.orig"
+            fi
+        fi
+    done
+
+    # Некоторые сборки ищут ядро относительно корня приложения:
+    # <APP_ROOT>/core/... — даём ссылку на bin/core, если каталога нет.
+    if [[ -d "$APP_ROOT/bin/core" && ! -e "$APP_ROOT/core" ]]; then
+        ln -sfn bin/core "$APP_ROOT/core"
+        log "Ссылка: $APP_ROOT/core -> bin/core"
+    fi
+
+    # Перезапуск сервисов из пакета
+    for rp in "${INPUT_RPMS[@]}"; do
+        while IFS= read -r unit; do
+            case "$unit" in
+                */systemd/system/*.service)
+                    unit_name="$(basename "$unit")"
+                    log "Перезапуск сервиса: $unit_name"
+                    systemctl daemon-reload 2>/dev/null || true
+                    systemctl restart "$unit_name" 2>/dev/null || true
+                    ;;
+            esac
+        done < <(rpm -qlp "$rp" 2>/dev/null)
+    done
+fi
+
+###############################################################################
+# Фаза 7: проверка
+###############################################################################
+
+FAIL_VERIFY=0
+
+if [[ -n "$RT_LD" ]]; then
+    echo
+    echo "------------------------------------------------------------"
+    echo "Проверка загрузки (ld --list, БЕЗ --library-path — как в рантайме)"
+    echo "------------------------------------------------------------"
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && log "system-link: $line"
+    done < "$SYSTEM_LINKS" 2>/dev/null
+    while IFS= read -r real_path; do
+        [[ -z "$real_path" ]] && continue
+        out="$("$RT_LD" --list "$real_path.orig" 2>&1 || true)"
+        # Библиотеки семейства glibc обязаны браться из приватного рантайма:
+        # системные (ld.so.cache) несовместимы с приватным ld по GLIBC_PRIVATE.
+        # Прочие системные библиотеки (libGL и т.п.) — допустимы: ABI стабилен.
+        problems="$(printf '%s\n' "$out" \
+            | grep -E 'not found|invalid ELF|error while' || true)"
+        bad_glibc="$(printf '%s\n' "$out" \
+            | grep -E '[[:space:]](libc|libm|libpthread|libdl|librt|libutil|libresolv|libanl|libnsl|libnss_[a-z0-9_]+|libBrokenLocale|libmvec|libthread_db|libgcc_s|libstdc\+\+)\.so[0-9.]*[[:space:]]' \
+            | grep -Ev "$LIBDIR|$RT_ROOT|\.\./lib/" || true)"
+        if [[ -n "$bad_glibc" ]]; then
+            problems+="$bad_glibc"
+        fi
+        interp="$(file -b "$real_path.orig" 2>/dev/null | grep -oE 'interpreter [^,]+')"
+        if [[ "$interp" != "interpreter $APP_ROOT/.ld64" ]]; then
+            warn "$real_path.orig: interp не пропатчен ($interp)"
+            FAIL_VERIFY=1
+        fi
+        if [[ -n "$problems" ]]; then
+            warn "$real_path.orig: проблемы загрузки:"
+            printf '%s\n' "$problems" | sed 's/^/      /' >&2
+            FAIL_VERIFY=1
+        fi
+        if [[ -z "$problems" && "$interp" == "interpreter $APP_ROOT/.ld64" ]]; then
+            log "OK: $real_path"
+        fi
+    done < "$WRAPPED_LIST"
+fi
+
+WRAPPED_COUNT=0
+[[ -f "$WRAPPED_LIST" ]] && WRAPPED_COUNT="$(grep -c . "$WRAPPED_LIST" || true)"
+
+if [[ "$DNF_RESULT" == "ok" ]]; then
+    METHOD="dnf"
+else
+    METHOD="rpm --nodeps"
+fi
+[[ -n "$RT_LD" ]] && METHOD="$METHOD + приватный рантайм"
+
+echo
+echo "============================================================"
+if (( FAIL_VERIFY )); then
+    echo "УСТАНОВКА С ЗАМЕЧАНИЯМИ ⚠"
+else
+    echo "УСТАНОВКА ЗАВЕРШЕНА ✅"
+fi
+echo "============================================================"
+echo "Пакет(ы)            : ${INPUT_RPMS[*]}"
+echo "Метод               : $METHOD"
+echo "Рантайм             : ${RT_ROOT:-нет}"
+echo "Обёрнутых бинарников: $WRAPPED_COUNT"
+echo "Логи и отчёты       : $WORKDIR"
+echo
+echo "Что дальше:"
+echo "  - GUI: команда «happ» или ярлык в меню;"
+echo "  - сервис: systemctl status happd.service;"
+echo "  - удалить: rpm -e ${PRIMARY_NAME:-happ} && rm -rf $APP_ROOT"
+echo "============================================================"
+
+{
+    echo "date: $(date -Is)"
+    echo "rpms: ${INPUT_RPMS[*]}"
+    echo "method: $METHOD"
+    echo "app_root: $APP_ROOT"
+    echo "runtime: $RT_ROOT"
+    echo "libdir: $LIBDIR"
+    echo "system_links:"; cat "$SYSTEM_LINKS" 2>/dev/null
+    echo "wrapped:"; cat "$WRAPPED_LIST" 2>/dev/null
+    echo "elf_report:"; cat "$ELF_REPORT" 2>/dev/null
+} > "$WORKDIR/RESULT.txt"
+
+exit "$FAIL_VERIFY"
